@@ -4,29 +4,61 @@
  *
  * Per TI datasheet SBAS362F. The chip is write-only over SPI (no DOUT),
  * 24-bit frames clocked MSB-first, ~SYNC active LOW. SPI mode 1
- * (CPOL=0, CPHA=1).
+ * (CPOL=0, CPHA=1). Two output channels A / B, each with an input
+ * buffer and a DAC register; LD1:LD0 in the control byte selects which
+ * (if any) DAC registers are latched from the buffers on the rising
+ * ~SYNC at the end of each frame.
  *
- * 24-bit frame layout:
- *   DB23..DB16  control byte (see ::DAC8552LoadMode + ::DAC8552Channel +
- *                              ::DAC8552PowerMode)
+ * Frame layout (DB23..DB0, MSB first):
+ *   DB23..DB16  control byte (load + buffer + power, see enums)
  *   DB15..DB0   16-bit unsigned code, 0..0xFFFF -> 0..V_REF
  *
- * Control-byte bit positions (table 1):
- *   bit 7 (DB23) : LD1   } load-control
- *   bit 6 (DB22) : LD0   } LD1:LD0 = 00 -> stage in buffer only
- *                          LD1:LD0 = 10 -> load THIS DAC on rising ~SYNC
- *                          LD1:LD0 = 11 -> load BOTH DACs on rising ~SYNC
- *   bit 5 (DB21) : X
- *   bit 4 (DB20) : BUF_SEL  (0 = buffer A, 1 = buffer B)
- *   bit 3 (DB19) : X
- *   bit 2 (DB18) : X
- *   bit 1 (DB17) : PD1   } power: 00 = active, 01 = 1k to GND,
+ * Control-byte bit positions (SBAS362F table 1):
+ *   bit 7 (DB23) : LD1   } 00 = buffer only, 10 = load THIS,
+ *   bit 6 (DB22) : LD0   } 11 = load ALL
+ *   bit 4 (DB20) : BUF_SEL (0 = buffer A, 1 = buffer B)
+ *   bit 1 (DB17) : PD1   } 00 = active, 01 = 1k to GND,
  *   bit 0 (DB16) : PD0     10 = 100k to GND, 11 = Hi-Z
  *
  * The driver is HAL-injected: the application supplies a ``spiWrite``
  * function pointer that clocks 3 bytes out on MOSI with ~SYNC handled
  * by the platform (e.g. the IDF SPI device's CS line). The driver
  * never touches GPIO directly.
+ *
+ * API layering:
+ *
+ *   1. Lifecycle
+ *        dac8552Init             stash HAL, no chip touch.
+ *
+ *   2. Power-mode control
+ *        dac8552Configure        per-channel power mode in one
+ *                                synchronous LOAD_ALL frame pair (also
+ *                                wakes both channels from boot Hi-Z).
+ *                                Takes the two power modes directly.
+ *        dac8552SetPowerMode     change ONE channel's power mode in
+ *                                place, no DAC update.
+ *
+ *   3. Buffer staging (no DAC update)
+ *        dac8552WriteBuffer      stage one channel's input buffer.
+ *
+ *   4. Output latch
+ *        dac8552Write            write ONE channel and latch THAT
+ *                                channel (LOAD_THIS).
+ *        dac8552WriteAll         write BOTH channels (independent codes)
+ *                                in one synchronous LOAD_ALL frame pair
+ *                                -- the glitch-free push-pull primitive.
+ *        dac8552LatchChannel     latch ONE channel's DAC register from
+ *                                its current input buffer (buffer is
+ *                                not disturbed).
+ *        dac8552LatchAll         latch BOTH DAC registers from their
+ *                                current input buffers (neither buffer
+ *                                is disturbed).
+ *
+ *   5. Read-back (driver-side cache; the chip has no DOUT)
+ *        dac8552GetLastValue     return the last code commanded for
+ *                                a channel (whether via Write, WriteAll,
+ *                                or WriteBuffer).
+ *        dac8552GetPowerMode     return a channel's current power mode.
  *
  * @author Orion Serup <orion@crablabs.io>
  */
@@ -57,52 +89,57 @@ typedef enum
 {
 	DAC8552_CHANNEL_A = 0,
 	DAC8552_CHANNEL_B = 1,
+	DAC8552_CHANNEL_COUNT = 2,
 } DAC8552Channel;
 
 /** @brief LD1:LD0 field encoding, pre-shifted to bits 7:6 of the
- *         control byte so they can be OR-ed in directly. */
+ *         control byte. Internal use; public callers pick a higher-
+ *         level entry point. */
 typedef enum
 {
-	DAC8552_LOAD_BUFFER_ONLY = 0x00U, ///< Stage in input buffer, no DAC update.
-	DAC8552_LOAD_THIS        = 0x80U, ///< Update THIS DAC on rising ~SYNC.
-	DAC8552_LOAD_ALL         = 0xC0U, ///< Update BOTH DACs on rising ~SYNC.
+	DAC8552_LOAD_BUFFER_ONLY = 0x00U,
+	DAC8552_LOAD_THIS        = 0x80U,
+	DAC8552_LOAD_ALL         = 0xC0U,
 } DAC8552LoadMode;
 
 /** @brief PD1:PD0 field encoding, pre-shifted to bits 1:0. */
 typedef enum
 {
-	DAC8552_POWER_ACTIVE  = 0x00U, ///< Normal operating mode.
-	DAC8552_POWER_1K_GND  = 0x01U, ///< Output: 1 kOhm to GND.
-	DAC8552_POWER_100K_GND= 0x02U, ///< Output: 100 kOhm to GND.
-	DAC8552_POWER_HIZ     = 0x03U, ///< Output: Hi-Z (boot default).
+	DAC8552_POWER_ACTIVE   = 0x00U, ///< Normal operating mode.
+	DAC8552_POWER_1K_GND   = 0x01U, ///< Output: 1 kOhm to GND.
+	DAC8552_POWER_100K_GND = 0x02U, ///< Output: 100 kOhm to GND.
+	DAC8552_POWER_HIZ      = 0x03U, ///< Output: Hi-Z (boot default).
 } DAC8552PowerMode;
 
-/** @brief HAL adapter the driver calls into. The application provides
- *         the SPI side; the driver does not know about CS lines, DMA,
- *         queues, or anything else platform-specific. */
+/** @brief HAL adapter the driver calls into. */
 typedef struct
 {
 	/**
 	 * @brief Clock @p length_bytes bytes of @p data out on the chip's
 	 *        MOSI line, with ~SYNC asserted around the whole call.
-	 *
 	 * @return 0 on success, non-zero on hardware failure.
 	 */
 	int (*spiWrite)(const void* const data, const uint8_t length_bytes);
 } DAC8552HAL;
 
-/** @brief Device handle. Hold one of these per chip on the bus. */
+/** @brief Device handle. One per chip on the bus. Power mode + last
+ *         commanded value per channel live here -- the chip itself has
+ *         no DOUT, so the driver-side cache IS the truth. */
 typedef struct
 {
-	DAC8552HAL hal;
-	bool is_initialized;
+	DAC8552HAL       hal;
+	bool             is_initialized;
+	DAC8552PowerMode power_mode[DAC8552_CHANNEL_COUNT];
+	uint16_t         last_value[DAC8552_CHANNEL_COUNT];
 } DAC8552;
 
+/* -- 1. Lifecycle ------------------------------------------------------- */
+
 /**
- * @brief Stash the HAL function pointers into @p dev. Does NOT touch the
- *        chip -- bring-up sequences (wake from Hi-Z, mid-rail park) are
- *        left to the application so it can decide the safe initial
- *        state for the downstream analog stage.
+ * @brief Stash the HAL function pointers into @p dev and seed the
+ *        driver cache to the chip's boot defaults (Hi-Z, code 0 on
+ *        both channels). Does NOT touch the chip. Call
+ *        ::dac8552Configure next to wake from Hi-Z.
  *
  * @return ::DAC8552_ERROR_OK on success;
  *         ::DAC8552_ERROR_NULL_PARAM if either argument is NULL or if
@@ -110,43 +147,94 @@ typedef struct
  */
 DAC8552Error dac8552Init(DAC8552* const dev, const DAC8552HAL* const hal);
 
-/**
- * @brief Write one 24-bit frame: control byte (load mode + channel +
- *        power mode) followed by the 16-bit code.
- *
- * @param[in] ch          Which channel's INPUT buffer to write.
- * @param[in] load_mode   When the chip should latch the buffer to the
- *                        output.
- * @param[in] power_mode  Power-down state for this channel.
- * @param[in] code        Unsigned 16-bit code; 0 -> 0 V, 0xFFFF -> V_REF.
- *
- * @return ::DAC8552_ERROR_OK on success;
- *         ::DAC8552_ERROR_NOT_INITIALIZED if ::dac8552Init has not run;
- *         ::DAC8552_ERROR_SPI if the HAL spiWrite returned non-zero.
- */
-DAC8552Error dac8552WriteCode(const DAC8552* const dev,
-                              const DAC8552Channel ch,
-                              const DAC8552LoadMode load_mode,
-                              const DAC8552PowerMode power_mode,
-                              const uint16_t code);
+/* -- 2. Power-mode control --------------------------------------------- */
 
 /**
- * @brief Glitch-free synchronous update of both outputs. Stages @p code_a
- *        in buffer A (no DAC update), then writes @p code_b to buffer B
- *        with LOAD_ALL so both outputs change in lock-step on the rising
- *        ~SYNC at the end of the B frame.
- *
- *        This is the right primitive for differential / push-pull drive:
- *        the load points are coincident at the chip and the analog stage
- *        sees no intermediate half-step.
- *
- * @return ::DAC8552_ERROR_OK on success; the first non-OK code if either
- *         frame failed (no rollback -- the chip is in whatever state the
- *         partial sequence left it).
+ * @brief Apply per-channel power mode in one synchronous LOAD_ALL
+ *        frame pair. Also wakes both channels from the boot-default
+ *        Hi-Z state. Input buffers and DAC registers latch to 0.
  */
-DAC8552Error dac8552WriteBothSync(const DAC8552* const dev,
-                                  const uint16_t code_a,
-                                  const uint16_t code_b);
+DAC8552Error dac8552Configure(DAC8552* const dev,
+                              const DAC8552PowerMode power_a,
+                              const DAC8552PowerMode power_b);
+
+/**
+ * @brief Change ONE channel's power mode in place. Sends a single
+ *        buffer-only frame with the new PD field; the other channel
+ *        is untouched. The DAC output for @p ch does NOT latch.
+ */
+DAC8552Error dac8552SetPowerMode(DAC8552* const dev,
+                                 const DAC8552Channel ch,
+                                 const DAC8552PowerMode mode);
+
+/* -- 3. Buffer staging (no DAC update) --------------------------------- */
+
+/**
+ * @brief Stage @p code in one channel's input buffer WITHOUT updating
+ *        the DAC output. Pair with ::dac8552LatchChannel or
+ *        ::dac8552LatchAll to apply later.
+ */
+DAC8552Error dac8552WriteBuffer(DAC8552* const dev,
+                                const DAC8552Channel ch,
+                                const uint16_t code);
+
+/* -- 4. Output latch --------------------------------------------------- */
+
+/**
+ * @brief Write ONE channel's input buffer AND latch it immediately
+ *        (LOAD_THIS). The other channel is untouched.
+ */
+DAC8552Error dac8552Write(DAC8552* const dev,
+                          const DAC8552Channel ch,
+                          const uint16_t code);
+
+/**
+ * @brief Write BOTH channels (independent codes) in one synchronous
+ *        LOAD_ALL frame pair. Stages A in its buffer, then writes B
+ *        with LOAD_ALL so both DAC registers latch in lock-step on
+ *        the rising ~SYNC at the end of the B frame.
+ *
+ *        Glitch-free primitive for push-pull / differential drive.
+ *        Pass @p code_a == @p code_b to park both channels together.
+ */
+DAC8552Error dac8552WriteAll(DAC8552* const dev,
+                             const uint16_t code_a,
+                             const uint16_t code_b);
+
+/**
+ * @brief Latch ONE channel's DAC register from its current input
+ *        buffer (LOAD_THIS). Re-emits the cached buffer code so the
+ *        buffer is not disturbed -- only the DAC register updates.
+ */
+DAC8552Error dac8552LatchChannel(DAC8552* const dev,
+                                 const DAC8552Channel ch);
+
+/**
+ * @brief Latch BOTH DAC registers from their current input buffers
+ *        (LOAD_ALL). Re-emits the cached buffer codes so neither
+ *        buffer is disturbed -- both DAC registers update
+ *        simultaneously.
+ */
+DAC8552Error dac8552LatchAll(DAC8552* const dev);
+
+/* -- 5. Read-back (driver-side cache) ---------------------------------- */
+
+/**
+ * @brief Return the last code commanded for @p ch (via any write or
+ *        buffer-staging call). The chip has no DOUT -- this driver
+ *        cache IS the answer.
+ */
+DAC8552Error dac8552GetLastValue(const DAC8552* const dev,
+                                 const DAC8552Channel ch,
+                                 uint16_t* const out_code);
+
+/**
+ * @brief Return @p ch's current power mode (as set by ::dac8552Init,
+ *        ::dac8552Configure, or ::dac8552SetPowerMode).
+ */
+DAC8552Error dac8552GetPowerMode(const DAC8552* const dev,
+                                 const DAC8552Channel ch,
+                                 DAC8552PowerMode* const out_mode);
 
 #ifdef __cplusplus
 }
