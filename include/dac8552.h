@@ -13,10 +13,13 @@
  *   DB23..DB16  control byte (load + buffer + power, see enums)
  *   DB15..DB0   16-bit unsigned code, 0..0xFFFF -> 0..V_REF
  *
- * Control-byte bit positions (SBAS362F table 1):
- *   bit 7 (DB23) : LD1   } 00 = buffer only, 10 = load THIS,
- *   bit 6 (DB22) : LD0   } 11 = load ALL
- *   bit 4 (DB20) : BUF_SEL (0 = buffer A, 1 = buffer B)
+ * Control-byte bit positions (SLAS430A Figure 43 / Table 1):
+ *   bit 7 (DB23) : RESERVED (must be 0)
+ *   bit 6 (DB22) : RESERVED (must be 0)
+ *   bit 5 (DB21) : LDB  -- 1 = load DAC B from buffer B
+ *   bit 4 (DB20) : LDA  -- 1 = load DAC A from buffer A
+ *   bit 3 (DB19) : DON'T CARE
+ *   bit 2 (DB18) : BUF_SEL (0 = data written to buffer A, 1 = buffer B)
  *   bit 1 (DB17) : PD1   } 00 = active, 01 = 1k to GND,
  *   bit 0 (DB16) : PD0     10 = 100k to GND, 11 = Hi-Z
  *
@@ -42,8 +45,8 @@
  *        dac8552WriteBuffer      stage one channel's input buffer.
  *
  *   4. Output latch
- *        dac8552Write            write ONE channel and latch THAT
- *                                channel (LOAD_THIS).
+ *        dac8552Write            write ONE channel's buffer AND load that
+ *                                channel's DAC register (LDA or LDB).
  *        dac8552WriteAll         write BOTH channels (independent codes)
  *                                in one synchronous LOAD_ALL frame pair
  *                                -- the glitch-free push-pull primitive.
@@ -92,14 +95,18 @@ typedef enum
 	DAC8552_CHANNEL_COUNT = 2,
 } DAC8552Channel;
 
-/** @brief LD1:LD0 field encoding, pre-shifted to bits 7:6 of the
- *         control byte. Internal use; public callers pick a higher-
- *         level entry point. */
+/** @brief DAC-register load mode encoded as the LDA/LDB bits in the
+ *         control byte (SLAS430A Figure 43 + Table 1):
+ *             DB21 = LDB (bit 5) -- 1 = load DAC B from buffer B
+ *             DB20 = LDA (bit 4) -- 1 = load DAC A from buffer A
+ *         DB23, DB22 are RESERVED and must be 0. Internal use; public
+ *         callers pick a higher-level entry point. */
 typedef enum
 {
-	DAC8552_LOAD_BUFFER_ONLY = 0x00U,
-	DAC8552_LOAD_THIS        = 0x80U,
-	DAC8552_LOAD_ALL         = 0xC0U,
+	DAC8552_LOAD_BUFFER_ONLY = 0x00U, ///< LDA=0, LDB=0 -- buffer write, no DAC update.
+	DAC8552_LOAD_A           = 0x10U, ///< LDA=1 -- load DAC A from buffer A.
+	DAC8552_LOAD_B           = 0x20U, ///< LDB=1 -- load DAC B from buffer B.
+	DAC8552_LOAD_ALL         = 0x30U, ///< LDA=1, LDB=1 -- load both.
 } DAC8552LoadMode;
 
 /** @brief PD1:PD0 field encoding, pre-shifted to bits 1:0. */
@@ -182,7 +189,7 @@ DAC8552Error dac8552WriteBuffer(DAC8552* const dev,
 
 /**
  * @brief Write ONE channel's input buffer AND latch it immediately
- *        (LOAD_THIS). The other channel is untouched.
+ *        (LDA/LDB). The other channel is untouched.
  */
 DAC8552Error dac8552Write(DAC8552* const dev,
                           const DAC8552Channel ch,
@@ -203,7 +210,7 @@ DAC8552Error dac8552WriteAll(DAC8552* const dev,
 
 /**
  * @brief Latch ONE channel's DAC register from its current input
- *        buffer (LOAD_THIS). Re-emits the cached buffer code so the
+ *        buffer (LDA/LDB). Re-emits the cached buffer code so the
  *        buffer is not disturbed -- only the DAC register updates.
  */
 DAC8552Error dac8552LatchChannel(DAC8552* const dev,

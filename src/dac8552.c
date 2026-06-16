@@ -11,12 +11,20 @@
 #include <stddef.h>
 
 /* -- Control-byte field masks ------------------------------------------ *
- * Bit positions match SBAS362F table 1; ::DAC8552LoadMode and             *
- * ::DAC8552PowerMode enum values are already pre-shifted into the byte    *
- * so they can be OR-ed directly. Only the channel selector still needs    *
- * a runtime shift, hence the BUF_SEL_B mask below.                        */
+ * Bit positions match SLAS430A Figure 43 + Table 1.                       *
+ *   DB23, DB22 : RESERVED (must be 0)                                     *
+ *   DB21       : LDB  -- 1 = load DAC B from buffer B                     *
+ *   DB20       : LDA  -- 1 = load DAC A from buffer A                     *
+ *   DB19       : don't care                                               *
+ *   DB18       : Buffer Select (0 = write data to buffer A,               *
+ *                               1 = write data to buffer B)               *
+ *   DB17, DB16 : PD1, PD0 (power mode of the buffer being written)        *
+ *                                                                         *
+ * ::DAC8552LoadMode and ::DAC8552PowerMode enum values are pre-shifted    *
+ * into the byte so they can be OR-ed directly. The channel selector       *
+ * needs a runtime shift, hence the BUF_SEL_B mask below.                  */
 
-#define DAC8552_CTRL_BUF_SEL_B 0x10U  ///< Bit 4 of control byte = 1 -> buffer B.
+#define DAC8552_CTRL_BUF_SEL_B 0x04U  ///< Bit 2 of control byte = 1 -> data goes to buffer B.
 
 /* -- Static prototypes -------------------------------------------------- */
 
@@ -56,8 +64,8 @@ DAC8552Error dac8552Configure(DAC8552* const dev,
 	if (!dev->is_initialized)
 		return DAC8552_ERROR_NOT_INITIALIZED;
 
-	// Stage channel A: buffer-only frame applies A's PD field; the
-	// buffer captures 0.
+	// Stage channel A: write 0 to buffer A with A's PD field; no DAC
+	// update yet (LDA = LDB = 0).
 	const uint8_t ctrl_a = dac8552BuildCtrl(DAC8552_CHANNEL_A,
 	                                        DAC8552_LOAD_BUFFER_ONLY,
 	                                        power_a);
@@ -65,8 +73,9 @@ DAC8552Error dac8552Configure(DAC8552* const dev,
 	if (err_a != DAC8552_ERROR_OK)
 		return err_a;
 
-	// Channel B with LOAD_ALL: applies B's PD field AND latches both
-	// DAC registers from the (now zero) buffers.
+	// Channel B with LOAD_ALL (LDA=1, LDB=1): write 0 to buffer B with
+	// B's PD field, AND simultaneously latch BOTH DAC registers from
+	// their buffers (both are now 0).
 	const uint8_t ctrl_b = dac8552BuildCtrl(DAC8552_CHANNEL_B,
 	                                        DAC8552_LOAD_ALL,
 	                                        power_b);
@@ -138,8 +147,14 @@ DAC8552Error dac8552Write(DAC8552* const dev,
 	if (!dac8552IsValidChannel(ch))
 		return DAC8552_ERROR_INVALID_PARAM;
 
-	const uint8_t ctrl = dac8552BuildCtrl(ch, DAC8552_LOAD_THIS,
-	                                      dev->power_mode[ch]);
+	// Per SLAS430A Operation Example 2: "Load New Data to DAC A and
+	// DAC B Sequentially". One frame writes data to the selected
+	// channel's input buffer AND latches that channel's DAC register.
+	// Channel A uses LDA; channel B uses LDB. Buffer Select must point
+	// at the same channel so the 16-bit data lands in the right buffer.
+	const DAC8552LoadMode load = (ch == DAC8552_CHANNEL_A)
+	                             ? DAC8552_LOAD_A : DAC8552_LOAD_B;
+	const uint8_t ctrl = dac8552BuildCtrl(ch, load, dev->power_mode[ch]);
 	const DAC8552Error err = dac8552EmitFrame(dev, ctrl, code);
 	if (err != DAC8552_ERROR_OK)
 		return err;
@@ -187,11 +202,12 @@ DAC8552Error dac8552LatchChannel(DAC8552* const dev, const DAC8552Channel ch)
 	if (!dac8552IsValidChannel(ch))
 		return DAC8552_ERROR_INVALID_PARAM;
 
-	// LOAD_THIS with the cached value: the buffer is re-written with
-	// the same code (no observable change) and the DAC register updates
-	// from it.
-	const uint8_t ctrl = dac8552BuildCtrl(ch, DAC8552_LOAD_THIS,
-	                                      dev->power_mode[ch]);
+	// Latch the channel's DAC register from its current input buffer.
+	// We re-emit a frame with the cached code -- the buffer write is a
+	// no-op (same code), but LDA/LDB asserts so the DAC register reloads.
+	const DAC8552LoadMode load = (ch == DAC8552_CHANNEL_A)
+	                             ? DAC8552_LOAD_A : DAC8552_LOAD_B;
+	const uint8_t ctrl = dac8552BuildCtrl(ch, load, dev->power_mode[ch]);
 	return dac8552EmitFrame(dev, ctrl, dev->last_value[ch]);
 }
 
